@@ -19,7 +19,7 @@ import websockets
 SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
-CHUNK_MS = 100
+CHUNK_MS = 200
 CHUNK_BYTES = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * CHUNK_MS // 1_000
 DEFAULT_SPEAKER_VOLUME = 60
 TRANSLATION_URL = (
@@ -29,6 +29,26 @@ TRANSLATION_URL = (
 
 class RelayError(Exception):
     """A configuration or child-process error."""
+
+class RelayStatus:
+    def __init__(self) -> None:
+        self.input_bytes = 0
+        self.output_bytes = 0
+        self.transcript_fragments = 0
+
+
+def report(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+async def report_progress(status: RelayStatus) -> None:
+    while True:
+        await asyncio.sleep(15)
+        report(
+            f"Relay: {status.input_bytes / (SAMPLE_RATE * SAMPLE_WIDTH):.0f}s input, "
+            f"{status.output_bytes} English audio bytes, "
+            f"{status.transcript_fragments} transcript fragments"
+        )
 
 
 def executable(name: str) -> str:
@@ -130,6 +150,7 @@ async def stream_audio(
     websocket: websockets.ClientConnection,
     source: asyncio.StreamReader,
     source_process: asyncio.subprocess.Process,
+    status: RelayStatus,
 ) -> int:
     while chunk := await source.read(CHUNK_BYTES):
         await websocket.send(
@@ -140,6 +161,9 @@ async def stream_audio(
                 }
             )
         )
+        status.input_bytes += len(chunk)
+        if status.input_bytes == len(chunk):
+            report("Source audio reached the translation session.")
     await websocket.send(json.dumps({"type": "session.close"}))
     return await source_process.wait()
 
@@ -148,27 +172,36 @@ async def receive_events(
     websocket: websockets.ClientConnection,
     speaker: asyncio.subprocess.Process,
     transcript: TranscriptLog,
+    status: RelayStatus,
 ) -> None:
     assert speaker.stdin is not None
     async for message in websocket:
         event = json.loads(message)
         event_type = event.get("type")
-        if event_type == "session.output_audio.delta":
+        if event_type == "session.updated":
+            report("English translation session configured.")
+        elif event_type == "session.output_audio.delta":
+            audio = base64.b64decode(event["delta"])
             try:
-                speaker.stdin.write(base64.b64decode(event["delta"]))
+                speaker.stdin.write(audio)
                 await speaker.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as error:
-                status = "unknown status" if speaker.returncode is None else f"exit code {speaker.returncode}"
-                raise RelayError(f"ffplay stopped while playing translated audio ({status})") from error
+                state = "unknown status" if speaker.returncode is None else f"exit code {speaker.returncode}"
+                raise RelayError(f"ffplay stopped while playing translated audio ({state})") from error
+            status.output_bytes += len(audio)
+            if status.output_bytes == len(audio):
+                report("English audio reached the laptop output.")
         elif event_type in {
             "session.input_transcript.delta",
             "session.output_transcript.delta",
         }:
             transcript.write(event_type, event["delta"])
+            status.transcript_fragments += 1
         elif event_type == "error":
             raise RelayError(json.dumps(event, ensure_ascii=False))
         elif event_type == "session.closed":
             return
+    raise RelayError("Translation session ended without session.closed")
 
 
 async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: int) -> None:
@@ -183,6 +216,7 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
     )
     assert source.stdout is not None
     transcript = TranscriptLog(transcript_path)
+    status = RelayStatus()
     headers = {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Safety-Identifier": "x-space-translation-relay",
@@ -193,12 +227,19 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
                 json.dumps(
                     {
                         "type": "session.update",
-                        "session": {"audio": {"output": {"language": "en"}}},
+                        "session": {
+                            "audio": {
+                                "input": {"transcription": {"model": "gpt-realtime-whisper"}},
+                                "output": {"language": "en"},
+                            }
+                        },
                     }
                 )
             )
-            send_task = asyncio.create_task(stream_audio(websocket, source.stdout, source))
-            receive_task = asyncio.create_task(receive_events(websocket, speaker, transcript))
+            report("Connected to OpenAI; waiting for source audio.")
+            send_task = asyncio.create_task(stream_audio(websocket, source.stdout, source, status))
+            receive_task = asyncio.create_task(receive_events(websocket, speaker, transcript, status))
+            progress_task = asyncio.create_task(report_progress(status))
             try:
                 done, _ = await asyncio.wait(
                     (send_task, receive_task),
@@ -212,10 +253,11 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
                 else:
                     receive_task.result()
             finally:
+                progress_task.cancel()
                 for task in (send_task, receive_task):
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(send_task, receive_task, return_exceptions=True)
+                await asyncio.gather(send_task, receive_task, progress_task, return_exceptions=True)
     finally:
         transcript.close()
         if speaker.stdin:
