@@ -199,19 +199,23 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
             )
             send_task = asyncio.create_task(stream_audio(websocket, source.stdout, source))
             receive_task = asyncio.create_task(receive_events(websocket, speaker, transcript))
-            done, _ = await asyncio.wait(
-                (send_task, receive_task),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if send_task in done:
-                source_status = send_task.result()
-                await receive_task
-                if source_status != 0:
-                    raise RelayError(f"ffmpeg stopped with exit code {source_status}")
-            else:
-                receive_task.result()
-                send_task.cancel()
-                await asyncio.gather(send_task, return_exceptions=True)
+            try:
+                done, _ = await asyncio.wait(
+                    (send_task, receive_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if send_task in done:
+                    source_status = send_task.result()
+                    await receive_task
+                    if source_status != 0:
+                        raise RelayError(f"ffmpeg stopped with exit code {source_status}")
+                else:
+                    receive_task.result()
+            finally:
+                for task in (send_task, receive_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(send_task, receive_task, return_exceptions=True)
     finally:
         transcript.close()
         if speaker.stdin:
