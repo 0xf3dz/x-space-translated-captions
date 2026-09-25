@@ -104,8 +104,8 @@ def speaker_command(volume: int) -> list[str]:
         "s16le",
         "-ar",
         str(SAMPLE_RATE),
-        "-ac",
-        str(CHANNELS),
+        "-ch_layout",
+        "mono",
         "-i",
         "pipe:0",
     ]
@@ -126,7 +126,11 @@ class TranscriptLog:
             self._file.close()
 
 
-async def stream_audio(websocket: websockets.ClientConnection, source: asyncio.StreamReader) -> None:
+async def stream_audio(
+    websocket: websockets.ClientConnection,
+    source: asyncio.StreamReader,
+    source_process: asyncio.subprocess.Process,
+) -> int:
     while chunk := await source.read(CHUNK_BYTES):
         await websocket.send(
             json.dumps(
@@ -137,6 +141,7 @@ async def stream_audio(websocket: websockets.ClientConnection, source: asyncio.S
             )
         )
     await websocket.send(json.dumps({"type": "session.close"}))
+    return await source_process.wait()
 
 
 async def receive_events(
@@ -149,8 +154,12 @@ async def receive_events(
         event = json.loads(message)
         event_type = event.get("type")
         if event_type == "session.output_audio.delta":
-            speaker.stdin.write(base64.b64decode(event["delta"]))
-            await speaker.stdin.drain()
+            try:
+                speaker.stdin.write(base64.b64decode(event["delta"]))
+                await speaker.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as error:
+                status = "unknown status" if speaker.returncode is None else f"exit code {speaker.returncode}"
+                raise RelayError(f"ffplay stopped while playing translated audio ({status})") from error
         elif event_type in {
             "session.input_transcript.delta",
             "session.output_transcript.delta",
@@ -188,10 +197,21 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
                     }
                 )
             )
-            await asyncio.gather(
-                stream_audio(websocket, source.stdout),
-                receive_events(websocket, speaker, transcript),
+            send_task = asyncio.create_task(stream_audio(websocket, source.stdout, source))
+            receive_task = asyncio.create_task(receive_events(websocket, speaker, transcript))
+            done, _ = await asyncio.wait(
+                (send_task, receive_task),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if send_task in done:
+                source_status = send_task.result()
+                await receive_task
+                if source_status != 0:
+                    raise RelayError(f"ffmpeg stopped with exit code {source_status}")
+            else:
+                receive_task.result()
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
     finally:
         transcript.close()
         if speaker.stdin:
