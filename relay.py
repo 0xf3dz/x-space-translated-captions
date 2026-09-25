@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Relay a live HLS audio stream through OpenAI realtime translation."""
+"""Relay a live HLS audio stream through OpenAI realtime translation and laptop speakers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ CHANNELS = 1
 SAMPLE_WIDTH = 2
 CHUNK_MS = 100
 CHUNK_BYTES = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * CHUNK_MS // 1_000
+DEFAULT_SPEAKER_VOLUME = 60
 TRANSLATION_URL = (
     "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate"
 )
@@ -90,13 +91,15 @@ def source_command(hls_url: str) -> list[str]:
     ]
 
 
-def player_command() -> list[str]:
+def speaker_command(volume: int) -> list[str]:
     return [
         executable("ffplay"),
         "-hide_banner",
         "-loglevel",
         "warning",
         "-nodisp",
+        "-volume",
+        str(volume),
         "-f",
         "s16le",
         "-ar",
@@ -138,16 +141,16 @@ async def stream_audio(websocket: websockets.ClientConnection, source: asyncio.S
 
 async def receive_events(
     websocket: websockets.ClientConnection,
-    player: asyncio.subprocess.Process,
+    speaker: asyncio.subprocess.Process,
     transcript: TranscriptLog,
 ) -> None:
-    assert player.stdin is not None
+    assert speaker.stdin is not None
     async for message in websocket:
         event = json.loads(message)
         event_type = event.get("type")
         if event_type == "session.output_audio.delta":
-            player.stdin.write(base64.b64decode(event["delta"]))
-            await player.stdin.drain()
+            speaker.stdin.write(base64.b64decode(event["delta"]))
+            await speaker.stdin.drain()
         elif event_type in {
             "session.input_transcript.delta",
             "session.output_transcript.delta",
@@ -159,14 +162,14 @@ async def receive_events(
             return
 
 
-async def run_relay(hls_url: str, transcript_path: Path | None) -> None:
+async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: int) -> None:
     api_key = require_api_key()
     source = await asyncio.create_subprocess_exec(
         *source_command(hls_url),
         stdout=asyncio.subprocess.PIPE,
     )
-    player = await asyncio.create_subprocess_exec(
-        *player_command(),
+    speaker = await asyncio.create_subprocess_exec(
+        *speaker_command(speaker_volume),
         stdin=asyncio.subprocess.PIPE,
     )
     assert source.stdout is not None
@@ -187,18 +190,24 @@ async def run_relay(hls_url: str, transcript_path: Path | None) -> None:
             )
             await asyncio.gather(
                 stream_audio(websocket, source.stdout),
-                receive_events(websocket, player, transcript),
+                receive_events(websocket, speaker, transcript),
             )
     finally:
         transcript.close()
-        if player.stdin:
-            player.stdin.close()
+        if speaker.stdin:
+            speaker.stdin.close()
         if source.returncode is None:
             source.terminate()
-        if player.returncode is None:
-            player.terminate()
+        if speaker.returncode is None:
+            speaker.terminate()
         await source.wait()
-        await player.wait()
+        await speaker.wait()
+
+
+def validate_volume(value: int) -> int:
+    if not 0 <= value <= 100:
+        raise RelayError("--volume must be between 0 and 100")
+    return value
 
 
 def doctor() -> int:
@@ -216,14 +225,14 @@ def doctor() -> int:
         print(f"OPTIONAL: yt-dlp: {executable('yt-dlp')}")
     except RelayError:
         print("OPTIONAL: yt-dlp is absent; use --hls-url instead of --space-url")
-    if sys.platform == "darwin":
-        print("Set macOS Sound Output to the laptop headphone output before you start the relay.")
+    print("Set the laptop output to its built-in speakers, not Bluetooth earbuds.")
+    print("Place the host phone near the laptop speaker and mute host-phone playback.")
     for failure in failures:
         print(f"ERROR: {failure}", file=sys.stderr)
     return 1 if failures else 0
 
 
-async def play_tone(seconds: int) -> int:
+async def play_tone(seconds: int, volume: int) -> int:
     process = await asyncio.create_subprocess_exec(
         executable("ffplay"),
         "-hide_banner",
@@ -231,6 +240,8 @@ async def play_tone(seconds: int) -> int:
         "warning",
         "-nodisp",
         "-autoexit",
+        "-volume",
+        str(volume),
         "-f",
         "lavfi",
         "-i",
@@ -239,15 +250,15 @@ async def play_tone(seconds: int) -> int:
     return await process.wait()
 
 
-def test_tone(seconds: int) -> int:
-    return asyncio.run(play_tone(seconds))
+def test_tone(seconds: int, volume: int) -> int:
+    return asyncio.run(play_tone(seconds, volume))
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    run = commands.add_parser("run", help="translate a live Space into English")
+    run = commands.add_parser("run", help="translate a live Space into laptop speaker audio")
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument("--hls-url", help="live HLS URL from the source Space")
     source.add_argument("--space-url", help="live X Space URL; requires yt-dlp")
@@ -261,10 +272,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=Path,
         help="newline-delimited JSON transcript output",
     )
+    run.add_argument(
+        "--volume",
+        type=int,
+        default=DEFAULT_SPEAKER_VOLUME,
+        metavar="0-100",
+        help="laptop speaker volume for translated audio (default: %(default)s)",
+    )
 
     commands.add_parser("doctor", help="check required local software and configuration")
-    tone = commands.add_parser("test-tone", help="play a 1 kHz tone through the default laptop output")
+    tone = commands.add_parser("test-tone", help="play a 1 kHz tone through the laptop speakers")
     tone.add_argument("--seconds", type=int, default=5)
+    tone.add_argument(
+        "--volume",
+        type=int,
+        default=DEFAULT_SPEAKER_VOLUME,
+        metavar="0-100",
+        help="laptop speaker volume (default: %(default)s)",
+    )
     return parser.parse_args(argv)
 
 
@@ -275,11 +300,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "test-tone":
         if args.seconds < 1:
             raise RelayError("--seconds must be at least 1")
-        return test_tone(args.seconds)
+        return test_tone(args.seconds, validate_volume(args.volume))
     if args.transcript:
         args.transcript.parent.mkdir(parents=True, exist_ok=True)
     hls_url = args.hls_url or resolve_hls_url(args.space_url, args.cookies_from_browser)
-    asyncio.run(run_relay(hls_url, args.transcript))
+    asyncio.run(run_relay(hls_url, args.transcript, validate_volume(args.volume)))
     return 0
 
 
