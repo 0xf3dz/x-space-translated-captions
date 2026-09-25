@@ -204,39 +204,59 @@ async def receive_events(
     raise RelayError("Translation session ended without session.closed")
 
 
+async def expect_session_event(websocket: websockets.ClientConnection, expected: str) -> None:
+    try:
+        event = json.loads(await asyncio.wait_for(websocket.recv(), timeout=15))
+    except asyncio.TimeoutError as error:
+        raise RelayError(f"Timed out waiting for {expected}") from error
+    except websockets.exceptions.ConnectionClosed as error:
+        raise RelayError(f"OpenAI session closed: {error}") from error
+    if event.get("type") == "error":
+        detail = event.get("error", {})
+        raise RelayError(
+            f"OpenAI session rejected: {detail.get('code') or detail.get('type')}: "
+            f"{detail.get('message')}"
+        )
+    if event.get("type") != expected:
+        raise RelayError(f"Expected {expected}; received {event.get('type')}")
+
 async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: int) -> None:
     api_key = require_api_key()
-    source = await asyncio.create_subprocess_exec(
-        *source_command(hls_url),
-        stdout=asyncio.subprocess.PIPE,
-    )
-    speaker = await asyncio.create_subprocess_exec(
-        *speaker_command(speaker_volume),
-        stdin=asyncio.subprocess.PIPE,
-    )
-    assert source.stdout is not None
-    transcript = TranscriptLog(transcript_path)
-    status = RelayStatus()
     headers = {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Safety-Identifier": "x-space-translation-relay",
     }
-    try:
-        async with websockets.connect(TRANSLATION_URL, additional_headers=headers) as websocket:
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "audio": {
-                                "input": {"transcription": {"model": "gpt-realtime-whisper"}},
-                                "output": {"language": "en"},
-                            }
-                        },
-                    }
-                )
+    async with websockets.connect(TRANSLATION_URL, additional_headers=headers) as websocket:
+        await expect_session_event(websocket, "session.created")
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "audio": {
+                            "input": {"transcription": {"model": "gpt-realtime-whisper"}},
+                            "output": {"language": "en"},
+                        }
+                    },
+                }
             )
-            report("Connected to OpenAI; waiting for source audio.")
+        )
+        await expect_session_event(websocket, "session.updated")
+        report("English translation session configured; starting source audio.")
+        source = await asyncio.create_subprocess_exec(
+            *source_command(hls_url),
+            stdout=asyncio.subprocess.PIPE,
+        )
+        speaker = None
+        transcript = None
+        try:
+            speaker = await asyncio.create_subprocess_exec(
+                *speaker_command(speaker_volume),
+                stdin=asyncio.subprocess.PIPE,
+            )
+            assert source.stdout is not None
+            transcript = TranscriptLog(transcript_path)
+            status = RelayStatus()
             send_task = asyncio.create_task(stream_audio(websocket, source.stdout, source, status))
             receive_task = asyncio.create_task(receive_events(websocket, speaker, transcript, status))
             progress_task = asyncio.create_task(report_progress(status))
@@ -258,16 +278,18 @@ async def run_relay(hls_url: str, transcript_path: Path | None, speaker_volume: 
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(send_task, receive_task, progress_task, return_exceptions=True)
-    finally:
-        transcript.close()
-        if speaker.stdin:
-            speaker.stdin.close()
-        if source.returncode is None:
-            source.terminate()
-        if speaker.returncode is None:
-            speaker.terminate()
-        await source.wait()
-        await speaker.wait()
+        finally:
+            if transcript is not None:
+                transcript.close()
+            if speaker is not None:
+                if speaker.stdin:
+                    speaker.stdin.close()
+                if speaker.returncode is None:
+                    speaker.terminate()
+                await speaker.wait()
+            if source.returncode is None:
+                source.terminate()
+            await source.wait()
 
 
 def validate_volume(value: int) -> int:
